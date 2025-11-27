@@ -2,10 +2,11 @@ import express from "express";
 import jwt from "jsonwebtoken";
 import {
   foodCollection,
+  orderCollection,
   requestedCollection,
 } from "../config/dbCollections.js";
 import { ObjectId } from "mongodb";
-import { sendFoodRequestNotification } from "../config/emailService.js";
+import { sendFoodRequestNotification, sendBulkOrderNotification } from "../config/emailService.js";
 
 const foodRouter = express.Router();
 
@@ -24,7 +25,7 @@ const verifyToken = (req, res, next) => {
   });
 };
 
-foodRouter.get("/available-foods", async (req, res) => {
+foodRouter.get("/all-foods", async (req, res) => {
   const { status, search, location, sortBy, sortOrder, page, limit } =
     req.query;
 
@@ -68,7 +69,7 @@ foodRouter.get("/available-foods", async (req, res) => {
     // Execute query with pagination
     const foods = await foodCollection
       .find(query)
-      .sort(sort)
+      .sort(sort || { createdAt: -1 })
       .skip(skip)
       .limit(limitNum)
       .toArray();
@@ -134,13 +135,36 @@ foodRouter.post("/food-details", async (req, res) => {
 
 foodRouter.post("/manage-myfoods", verifyToken, async (req, res) => {
   const { email } = req.body;
+  const { page, limit } = req.query;
+
+  const pageNum = parseInt(page) || 1;
+  const limitNum = parseInt(limit) || 12;
+  const skip = (pageNum - 1) * limitNum;
+
   const query = {
     userEmail: email,
   };
   try {
-    const foods = foodCollection.find(query);
-    const result = await foods.toArray();
-    res.send(result);
+    const totalItems = await foodCollection.countDocuments(query);
+
+    const foods = await foodCollection
+      .find(query)
+      .sort({ _id: -1 })
+      .skip(skip)
+      .limit(limitNum)
+      .toArray();
+
+    res.send({
+      foods,
+      pagination: {
+        currentPage: pageNum,
+        totalPages: Math.ceil(totalItems / limitNum),
+        totalItems,
+        itemsPerPage: limitNum,
+        hasNextPage: pageNum * limitNum < totalItems,
+        hasPrevPage: pageNum > 1,
+      },
+    });
   } catch (error) {
     res.status(500).send({ message: "Something went wrong on server side" });
   }
@@ -149,10 +173,31 @@ foodRouter.post("/manage-myfoods", verifyToken, async (req, res) => {
 foodRouter.put("/update-food/:id", async (req, res) => {
   const { id } = req.params;
   const updateData = req.body;
-  const { foodImg, foodName, quantity, location, exDate, note } = updateData;
+  const { foodImg, foodName, quantity, location, exDate, note, description } = updateData;
   const filter = { _id: new ObjectId(id) };
 
   try {
+    const existingFood = await foodCollection.findOne(filter);
+    if (!existingFood) {
+      return res.status(404).send({ message: "Food item not found" });
+    }
+
+    const existingDescription = existingFood.description || existingFood.note;
+    const newDescription = description || note;
+
+    const isUnchanged =
+      existingFood.foodName === foodName &&
+      existingFood.foodImg === foodImg &&
+      existingFood.location === location &&
+      existingFood.quantity === Number(quantity) &&
+      new Date(existingFood.exDate).toISOString().split('T')[0] === new Date(exDate).toISOString().split('T')[0] &&
+      existingDescription === newDescription &&
+      (existingFood.price || 0) === (updateData.price || 0);
+
+    if (isUnchanged) {
+      return res.status(400).send({ message: "No changes detected. Please update at least one field." });
+    }
+
     const options = { upsert: true };
     const updateDoc = {
       $set: {
@@ -161,17 +206,19 @@ foodRouter.put("/update-food/:id", async (req, res) => {
         quantity,
         location,
         exDate,
-        note,
+        description: newDescription,
+        price: updateData.price,
       },
     };
     const result = await foodCollection.updateOne(filter, updateDoc, options);
     res.send(result);
   } catch (err) {
-    res.status(501).send({ message: "Server Side Error" });
+    console.error(err);
+    res.status(500).send({ message: "Server Side Error" });
   }
 });
 
-foodRouter.delete("/available-foods/:id", async (req, res) => {
+foodRouter.delete("/all-foods/:id", async (req, res) => {
   const { id } = req.params;
   const query = { _id: new ObjectId(id) };
   try {
@@ -187,7 +234,6 @@ foodRouter.post("/request-food/:id", async (req, res) => {
   const requestedData = req.body;
 
   try {
-    // First, fetch the food item to check if it's expired
     const query = { _id: new ObjectId(id) };
     const food = await foodCollection.findOne(query);
 
@@ -195,13 +241,17 @@ foodRouter.post("/request-food/:id", async (req, res) => {
       return res.status(404).send({ message: "Food item not found" });
     }
 
-    // Check if the food has expired
-    // exDate is now in ISO format
+    if (food.userEmail === requestedData.user) {
+      return res.status(400).send({
+        message: "You cannot request your own donated food.",
+      });
+    }
+
     const expirationDate = new Date(food.exDate);
-    expirationDate.setHours(0, 0, 0, 0); // Reset time to compare only dates
+    expirationDate.setHours(0, 0, 0, 0);
 
     const currentDate = new Date();
-    currentDate.setHours(0, 0, 0, 0); // Reset time to compare only dates
+    currentDate.setHours(0, 0, 0, 0);
 
     if (expirationDate < currentDate) {
       return res.status(400).send({
@@ -264,6 +314,60 @@ foodRouter.post("/requested-foods", verifyToken, async (req, res) => {
     res.send(result);
   } catch (err) {
     res.status(501).send({ message: "Server Side Error" });
+  }
+});
+
+// Bulk Order Route
+foodRouter.post("/orders", async (req, res) => {
+  const orderData = req.body;
+
+  try {
+    // Validate required fields
+    if (!orderData.quantity || !orderData.deliveryDate || !orderData.address) {
+      return res.status(400).send({ message: "Missing required fields" });
+    }
+
+    if (orderData.ownerEmail === orderData.userEmail) {
+      return res.status(400).send({
+        message: "You cannot order your own food.",
+      });
+    }
+
+    // Create order document
+    const order = {
+      ...orderData,
+      quantity: Number(orderData.quantity),
+      totalPrice: Number(orderData.totalPrice),
+      orderDate: new Date().toISOString(),
+      status: "Pending",
+    };
+
+    const result = await orderCollection.insertOne(order);
+
+    if (result.acknowledged) {
+      sendBulkOrderNotification({
+        ownerEmail: orderData.ownerEmail,
+        ownerName: orderData.ownerName,
+        foodName: orderData.foodName,
+        customerName: orderData.userName,
+        customerEmail: orderData.userEmail,
+        quantity: orderData.quantity,
+        deliveryDate: orderData.deliveryDate,
+        deliveryAddress: orderData.address,
+        totalPrice: orderData.totalPrice,
+        notes: orderData.description,
+      }).catch((err) => {
+        console.error("Failed to send bulk order email notification:", err);
+        // Don't fail the order if email fails
+      });
+
+      res.send({ message: "Order placed successfully", orderId: result.insertedId });
+    } else {
+      res.status(500).send({ message: "Failed to place order" });
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ message: "Server Side Error" });
   }
 });
 
