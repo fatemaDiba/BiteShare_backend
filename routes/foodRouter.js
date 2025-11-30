@@ -317,6 +317,124 @@ foodRouter.post("/requested-foods", verifyToken, async (req, res) => {
   }
 });
 
+// Get orders for report (filtered by month)
+foodRouter.get("/orders/report", verifyToken, async (req, res) => {
+  const { email, month } = req.query;
+  console.log(`Generating report for email: ${email}, month: ${month}`);
+
+  try {
+    const query = { userEmail: email };
+
+    // If month is provided (format: YYYY-MM), filter by that month
+    if (month) {
+      const startDate = new Date(`${month}-01T00:00:00.000Z`);
+      const endDate = new Date(startDate);
+      endDate.setMonth(endDate.getMonth() + 1);
+
+      query.orderDate = {
+        $gte: startDate.toISOString(),
+        $lt: endDate.toISOString(),
+      };
+      console.log(`Date range: ${startDate.toISOString()} to ${endDate.toISOString()}`);
+    }
+
+    console.log("Query:", JSON.stringify(query));
+
+    const orders = await orderCollection
+      .find(query)
+      .sort({ orderDate: -1 })
+      .toArray();
+
+    console.log(`Found ${orders.length} orders`);
+
+    res.send(orders);
+  } catch (err) {
+    console.error("Error fetching report data:", err);
+    res.status(500).send({ message: "Server Side Error" });
+  }
+});
+
+foodRouter.get("/orders/:email", verifyToken, async (req, res) => {
+  const { email } = req.params;
+  const query = {
+    user: email,
+  };
+  try {
+    const foods = orderCollection.find(query);
+    const result = await foods.toArray();
+    res.send(result);
+  } catch (err) {
+    res.status(501).send({ message: "Server Side Error" });
+  }
+});
+
+// Get orders by email (using query params)
+foodRouter.get("/orders", verifyToken, async (req, res) => {
+  const { email, page, limit } = req.query;
+
+  const pageNum = parseInt(page) || 1;
+  const limitNum = parseInt(limit) || 10;
+  const skip = (pageNum - 1) * limitNum;
+
+  const query = {
+    userEmail: email,
+  };
+  try {
+    const totalItems = await orderCollection.countDocuments(query);
+
+    const orders = await orderCollection
+      .find(query)
+      .sort({ orderDate: -1 })
+      .skip(skip)
+      .limit(limitNum)
+      .toArray();
+
+    res.send({
+      orders,
+      pagination: {
+        currentPage: pageNum,
+        totalPages: Math.ceil(totalItems / limitNum),
+        totalItems,
+        itemsPerPage: limitNum,
+        hasNextPage: pageNum * limitNum < totalItems,
+        hasPrevPage: pageNum > 1,
+      },
+    });
+  } catch (err) {
+    console.error("Error fetching orders:", err);
+    res.status(500).send({ message: "Server Side Error" });
+  }
+});
+
+
+
+// Update order status
+foodRouter.patch("/orders/:id", verifyToken, async (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body;
+
+  try {
+    const filter = { _id: new ObjectId(id) };
+    const updateDoc = {
+      $set: {
+        status: status,
+        updatedAt: new Date().toISOString(),
+      },
+    };
+
+    const result = await orderCollection.updateOne(filter, updateDoc);
+
+    if (result.modifiedCount > 0) {
+      res.send({ message: "Status updated successfully" });
+    } else {
+      res.status(404).send({ message: "Order not found or status unchanged" });
+    }
+  } catch (err) {
+    console.error("Error updating order status:", err);
+    res.status(500).send({ message: "Server Side Error" });
+  }
+});
+
 // Bulk Order Route
 foodRouter.post("/orders", async (req, res) => {
   const orderData = req.body;
@@ -370,5 +488,6 @@ foodRouter.post("/orders", async (req, res) => {
     res.status(500).send({ message: "Server Side Error" });
   }
 });
+
 
 export default foodRouter;
